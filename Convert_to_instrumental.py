@@ -40,6 +40,16 @@ v3.2 修复 (based on GPT code review):
     - 临时目录加 PID 后缀，防止多实例同时运行时文件冲突
     - 锁定 audio-separator==0.42.1，避免上游 API 变动导致兼容问题
     - safe_name() 增加 200 字符截断，防止超长文件名
+
+v3.3 融合优化 (best of Claude + GPT):
+    - _in_venv() 改用 resolve() + base_prefix 双重判断，更通用
+    - 伴奏识别改为评分机制（正分伴奏/负分人声/文件大小加权），告别关键词首匹配
+    - 全文件扫描改为 4MB 分块扫描，大文件不再整块读入内存
+    - ensure_wav() 用 delete_source 参数显式控制删除，函数接口更清晰
+    - safe_name() 增加 strip(".") / 连续空格合并 / 空值 fallback
+    - TMP_DIR 加时间戳+PID+tempfile.gettempdir()，可读性更好
+    - _find_audio_start 结构解析加 len(raw_hdr) 安全检查
+    - 设置 NCM_DEBUG=1 查看详细诊断信息
 """
 
 # ══════════════════════════════════════════════════════════
@@ -81,7 +91,12 @@ def find_compatible_python() -> str:
     return sys.executable
 
 def _in_venv() -> bool:
-    return sys.prefix == str(VENV_DIR)
+    """判断当前是否在目标 venv 中运行"""
+    try:
+        return (Path(sys.prefix).resolve() == VENV_DIR.resolve()
+                or sys.prefix != getattr(sys, "base_prefix", sys.prefix))
+    except Exception:
+        return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
 def _venv_has_packages() -> bool:
     r = subprocess.run(
@@ -130,7 +145,7 @@ if not _in_venv():
 # ══════════════════════════════════════════════════════════
 #  0-B  正式 import
 # ══════════════════════════════════════════════════════════
-import struct, json, base64, re, time
+import struct, json, base64, re, time, tempfile
 from Crypto.Cipher import AES
 from send2trash import send2trash
 
@@ -201,7 +216,8 @@ NCM_MAGIC = b"CTENFDAM"
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".aac", ".ogg", ".m4a", ".opus", ".wma", ".aiff"}
 
 DEFAULT_NCM_DIR = Path.home() / "Music" / "网易云音乐"
-TMP_DIR         = Path(f"/tmp/ncm_pipeline_{os.getpid()}")
+_RUN_ID         = time.strftime("%Y%m%d_%H%M%S")
+TMP_DIR         = Path(tempfile.gettempdir()) / f"ncm_pipeline_{_RUN_ID}_{os.getpid()}"
 DESKTOP         = Path.home() / "Desktop"
 MODEL_DIR       = Path.home() / ".audio_separator_models"
 
@@ -222,9 +238,12 @@ def dbg(step: str, msg: str):
 def hr():
     print("  " + "─" * 54)
 
-def safe_name(s: str, max_len: int = 200) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', "_", s).strip()
-    return name[:max_len] if len(name) > max_len else name
+def safe_name(s: str, max_len: int = 180) -> str:
+    s = re.sub(r'[\\/:*?"<>|]', "_", s).strip().strip(".")
+    s = re.sub(r"\s+", " ", s)
+    if not s:
+        return "audio"
+    return s[:max_len]
 
 def osascript(script: str) -> str:
     r = subprocess.run(["osascript", "-e", script],
@@ -367,8 +386,9 @@ def _probe_audio(audio_path: Path) -> dict:
         pass
     return {}
 
-def ensure_wav(audio_path: Path) -> Path:
-    """将任意格式音频转为标准 PCM WAV，兼容 ffmpeg 7.x/8.x"""
+def ensure_wav(audio_path: Path, delete_source: bool = False) -> Path:
+    """将任意格式音频转为标准 PCM WAV，兼容 ffmpeg 7.x/8.x。
+    delete_source=True 时转换后删除输入文件（仅用于临时副本）。"""
     if audio_path.suffix.lower() == ".wav":
         return audio_path
 
@@ -430,6 +450,8 @@ def ensure_wav(audio_path: Path) -> Path:
                 f"Python fallback 错误: {e_fb}"
             )
 
+    if delete_source and audio_path.exists():
+        audio_path.unlink(missing_ok=True)
     size_mb = wav_path.stat().st_size / 1024 / 1024
     log("Step 2", f"   ✅ 转换完成 → {wav_path.name}（{size_mb:.1f} MB）")
     return wav_path
@@ -464,15 +486,10 @@ def _python_fallback_convert(src: Path, dst: Path) -> Path:
 
 
 def prepare_audio(file_path: Path) -> tuple:
-    """返回 (audio_path, is_ncm, display_name)
-    调用者负责最终清理 TMP_DIR，中间转换产物在此函数内清理。
-    """
+    """返回 (audio_path, is_ncm, display_name)"""
     if file_path.suffix.lower() == ".ncm":
         decoded_path, display_name = decrypt_ncm(file_path)
-        audio_path = ensure_wav(decoded_path)
-        # 清理解密出的中间文件（如 .flac/.mp3），WAV 留给后续流程
-        if decoded_path != audio_path and decoded_path.exists():
-            decoded_path.unlink(missing_ok=True)
+        audio_path = ensure_wav(decoded_path, delete_source=True)
         return audio_path, True, display_name
     else:
         size_mb = file_path.stat().st_size / 1024 / 1024
@@ -494,10 +511,7 @@ def prepare_audio(file_path: Path) -> tuple:
         if file_path.suffix.lower() != ".wav":
             tmp_copy = TMP_DIR / file_path.name
             shutil.copy2(str(file_path), str(tmp_copy))
-            audio_path = ensure_wav(tmp_copy)
-            # 清理转换前的临时副本
-            if tmp_copy != audio_path and tmp_copy.exists():
-                tmp_copy.unlink(missing_ok=True)
+            audio_path = ensure_wav(tmp_copy, delete_source=True)
         else:
             audio_path = file_path
 
@@ -600,81 +614,104 @@ def _find_audio_start(f, pos_after_meta: int, key_stream: bytearray) -> tuple:
             return dec, "MP3"
         return dec, None
 
+    # 获取文件总大小
+    f.seek(0, 2)
+    file_size = f.tell()
+
     # ═══════════════════════════════════════════════════════
     # 策略 1: 结构化解析 CRC(4)+flag(1)+img_size(4)+img+audio
     # ═══════════════════════════════════════════════════════
     f.seek(pos_after_meta)
     raw_hdr = f.read(32)
 
-    crc_4 = raw_hdr[0:4]
-    flag_byte = raw_hdr[4]
-    img_size_a = struct.unpack("<I", raw_hdr[5:9])[0]
+    if len(raw_hdr) >= 9:
+        crc_4 = raw_hdr[0:4]
+        flag_byte = raw_hdr[4]
+        img_size_a = struct.unpack("<I", raw_hdr[5:9])[0]
 
-    dbg("Step 2", f"CRC={crc_4.hex()} flag=0x{flag_byte:02x} img_size={img_size_a}")
+        dbg("Step 2", f"CRC={crc_4.hex()} flag=0x{flag_byte:02x} img_size={img_size_a}")
 
-    if 10 <= img_size_a <= 2 * 1024 * 1024:
-        after_img1 = pos_after_meta + 4 + 1 + 4 + img_size_a
+        if 10 <= img_size_a <= 2 * 1024 * 1024:
+            after_img1 = pos_after_meta + 4 + 1 + 4 + img_size_a
 
-        # 直接在图片后尝试
-        dec, match = _try_decrypt_at(after_img1)
-        if match:
-            return after_img1, False, f"img({img_size_a}) → {match}"
+            # 直接在图片后尝试
+            dec, match = _try_decrypt_at(after_img1)
+            if match:
+                return after_img1, False, f"img({img_size_a}) → {match}"
 
-        # 可能有第二个图片块: img_size2(4) + img_data2
-        f.seek(after_img1)
-        post_img = f.read(32)
-        if len(post_img) >= 4:
-            img_size_b = struct.unpack("<I", post_img[0:4])[0]
-            if 0 <= img_size_b <= 2 * 1024 * 1024:
-                dec2, match2 = _try_decrypt_at(after_img1 + 4 + img_size_b)
-                if match2:
-                    return after_img1 + 4 + img_size_b, False, f"img1({img_size_a})+img2({img_size_b}) → {match2}"
+            # 可能有第二个图片块: img_size2(4) + img_data2
+            f.seek(after_img1)
+            post_img = f.read(32)
+            if len(post_img) >= 4:
+                img_size_b = struct.unpack("<I", post_img[0:4])[0]
+                if 0 <= img_size_b <= 2 * 1024 * 1024:
+                    dec2, match2 = _try_decrypt_at(after_img1 + 4 + img_size_b)
+                    if match2:
+                        return after_img1 + 4 + img_size_b, False, f"img1({img_size_a})+img2({img_size_b}) → {match2}"
 
-        # 尝试 flag(1)+img_size2(4)+img_data2
-        if len(post_img) >= 5:
-            img_size_c = struct.unpack("<I", post_img[1:5])[0]
-            if 0 <= img_size_c <= 2 * 1024 * 1024:
-                dec2b, match2b = _try_decrypt_at(after_img1 + 1 + 4 + img_size_c)
-                if match2b:
-                    return after_img1 + 1 + 4 + img_size_c, False, f"img1+flag2+img2({img_size_c}) → {match2b}"
+            # 尝试 flag(1)+img_size2(4)+img_data2
+            if len(post_img) >= 5:
+                img_size_c = struct.unpack("<I", post_img[1:5])[0]
+                if 0 <= img_size_c <= 2 * 1024 * 1024:
+                    dec2b, match2b = _try_decrypt_at(after_img1 + 1 + 4 + img_size_c)
+                    if match2b:
+                        return after_img1 + 1 + 4 + img_size_c, False, f"img1+flag2+img2({img_size_c}) → {match2b}"
 
-        # padding 探测 (+1..+16)
-        for extra in range(1, 17):
-            dec_x, match_x = _try_decrypt_at(after_img1 + extra)
-            if match_x:
-                return after_img1 + extra, False, f"img({img_size_a})+pad({extra}) → {match_x}"
+            # padding 探测 (+1..+16)
+            for extra in range(1, 17):
+                dec_x, match_x = _try_decrypt_at(after_img1 + extra)
+                if match_x:
+                    return after_img1 + extra, False, f"img({img_size_a})+pad({extra}) → {match_x}"
 
     # ═══════════════════════════════════════════════════════
-    # 策略 2: 全文件快速扫描
+    # 策略 2: 分块扫描（4MB 分块，避免大文件整块读入内存）
     # ═══════════════════════════════════════════════════════
-    dbg("Step 2", "结构解析未命中，进行全文件扫描...")
-    f.seek(pos_after_meta)
-    scan_buf = f.read()
+    dbg("Step 2", "结构解析未命中，进行分块扫描...")
 
-    # 第一轮: 预计算加密后的魔数模式，用 bytes.find 极速搜索
+    # 预计算加密后的魔数模式
+    enc_magics = {}
     for magic, fmt_name in AUDIO_MAGICS.items():
-        enc_magic = bytes(magic[i] ^ key_stream[i] for i in range(len(magic)))
-        idx = scan_buf.find(enc_magic)
-        if idx >= 0:
-            return pos_after_meta + idx, False, f"扫描 → {fmt_name.upper()}"
+        enc_magics[bytes(magic[i] ^ key_stream[i] for i in range(len(magic)))] = fmt_name
+    raw_magics = [b"fLaC", b"ID3", b"OggS", b"RIFF"]
 
-    # 第二轮: MP3 帧头逐字节搜索（跳过图片区域）
-    min_scan = min(8000, len(scan_buf))
-    for offset in range(min_scan, len(scan_buf) - 4):
-        dec_4 = bytes(scan_buf[offset + i] ^ key_stream[i] for i in range(4))
-        if _is_valid_mp3_header(dec_4):
-            return pos_after_meta + offset, False, "扫描 → MP3"
+    chunk_size = 4 * 1024 * 1024   # 4MB per chunk
+    overlap = 8                     # 魔数最长 4 字节，8 字节 overlap 足够
+    offset = pos_after_meta
+    is_first_chunk = True
 
-    # 第三轮: 搜索未加密原始魔数
-    for raw_magic in [b"fLaC", b"ID3", b"OggS", b"RIFF"]:
-        idx = scan_buf.find(raw_magic)
-        if idx >= 0:
-            return pos_after_meta + idx, True, f"未加密 {raw_magic.decode('ascii', errors='replace')}"
+    while offset < file_size:
+        f.seek(offset)
+        buf = f.read(min(chunk_size, file_size - offset))
+        if not buf:
+            break
+
+        # 第一轮: 加密魔数精确匹配（bytes.find 极速）
+        for enc_magic, fmt_name in enc_magics.items():
+            idx = buf.find(enc_magic)
+            if idx >= 0:
+                return offset + idx, False, f"扫描 → {fmt_name.upper()}"
+
+        # 第二轮: MP3 帧头（跳过第一块的图片区域）
+        mp3_start = min(8000, len(buf)) if is_first_chunk else 0
+        for inner in range(mp3_start, max(0, len(buf) - 4)):
+            dec_4 = bytes(buf[inner + i] ^ key_stream[i] for i in range(4))
+            if _is_valid_mp3_header(dec_4):
+                return offset + inner, False, "扫描 → MP3"
+
+        # 第三轮: 未加密原始魔数
+        for raw_magic in raw_magics:
+            idx = buf.find(raw_magic)
+            if idx >= 0:
+                return offset + idx, True, f"未加密 {raw_magic.decode('ascii', errors='replace')}"
+
+        is_first_chunk = False
+        offset += max(1, len(buf) - overlap)
 
     # fallback: 原始逻辑
     f.seek(pos_after_meta)
     f.read(4); f.read(5)
-    img_sz = struct.unpack("<I", f.read(4))[0]
+    img_sz_raw = f.read(4)
+    img_sz = struct.unpack("<I", img_sz_raw)[0] if len(img_sz_raw) == 4 else 0
     f.read(img_sz)
     log("Step 2", "   ⚠️  未能自动检测音频偏移，使用默认结构")
     return f.tell(), False, "fallback"
@@ -798,20 +835,38 @@ def remove_vocals(audio_path: Path, model_name: str,
         p = Path(fp)
         return p if p.is_absolute() else TMP_DIR / p.name
 
-    instrumental = None
-    for fp in outputs:
-        stem_lower = Path(fp).stem.lower()
-        if any(kw in stem_lower for kw in
-               ("instrumental", "no_vocal", "novocal", "inst", "karaoke", "kara", "other")):
-            instrumental = full_path(fp)
-            break
-    if instrumental is None:
-        instrumental = full_path(outputs[0])
-        log("Step 3", "   ⚠️  未能自动识别目标文件，已选用第一个输出。")
-
+    # ── 评分识别伴奏轨（正分=伴奏特征，负分=人声特征）──
+    scored = []
     for fp in outputs:
         p = full_path(fp)
-        if p != instrumental and p.exists():
+        stem_lower = p.stem.lower()
+        score = 0
+        # 强伴奏关键词
+        if any(kw in stem_lower for kw in ("instrumental", "no_vocal", "novocal")):
+            score += 100
+        if "karaoke" in stem_lower:
+            score += 80
+        # "inst" 做词边界匹配，避免误中 "instrument_settings" 等
+        if re.search(r"(^|[_ .-])inst([_ .-]|$)", stem_lower):
+            score += 60
+        if "other" in stem_lower:
+            score += 20
+        # 负分：人声轨关键词
+        if any(kw in stem_lower for kw in ("vocals", "vocal", "lead", "singer")):
+            score -= 120
+        # 文件大小微调（伴奏轨通常稍大）
+        if p.exists():
+            score += min(int(p.stat().st_size / 1024), 20)
+        scored.append((score, p))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    instrumental = scored[0][1]
+    if scored[0][0] <= 0:
+        log("Step 3", "   ⚠️  未能可靠识别伴奏轨，已按评分选用最可能结果。")
+
+    # 删除非伴奏轨
+    for _, p in scored[1:]:
+        if p.exists():
             p.unlink()
 
     return instrumental
