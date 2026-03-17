@@ -24,6 +24,14 @@ v3  修复:
     - soundfile / torchaudio 作为格式转换 fallback
     - 严格 MP3 帧头验证，排除假阳性
     - 设置 NCM_DEBUG=1 查看详细诊断信息
+
+v3.1 修复:
+    - venv 自举加重试计数器，防止包安装失败导致无限重启（最多 3 次）
+    - 单文件失败只清理当前文件的临时产物，不影响后续批量处理
+    - 分离前检查 WAV 时长（≥1s），过短直接报错而非 tensor crash
+    - ffmpeg timeout 按文件大小缩放（60s + 1.2s/MB），大文件不会超时
+    - 添加 atexit + SIGTERM/SIGHUP 信号处理，异常退出也能清理临时文件
+    - 模型首次下载提示更明确（约 200MB）
 """
 
 # ══════════════════════════════════════════════════════════
@@ -78,6 +86,15 @@ def _venv_has_packages() -> bool:
 def bootstrap_and_relaunch():
     import time
     ts = lambda: time.strftime("%H:%M:%S")
+
+    # ── 防止无限重启：通过环境变量计数 ──
+    boot_count = int(os.environ.get("_NCM_BOOT", "0"))
+    if boot_count >= 3:
+        print("\n  ❌ 虚拟环境多次重启仍无法加载依赖，请手动排查：")
+        print(f"     rm -rf {VENV_DIR}")
+        print(f"     {VENV_PY} -c \"import torch; print(torch.__version__)\"")
+        sys.exit(1)
+    os.environ["_NCM_BOOT"] = str(boot_count + 1)
 
     if not VENV_PY.exists():
         if VENV_DIR.exists():
@@ -361,6 +378,10 @@ def ensure_wav(audio_path: Path) -> Path:
     ext = audio_path.suffix.lstrip(".").lower()
     detected_codec = probe.get("codec", "")
 
+    # 超时按文件大小缩放：最少 60s，每 100MB 加 120s
+    file_size_mb = audio_path.stat().st_size / 1024 / 1024
+    timeout_sec = max(60, int(60 + file_size_mb * 1.2))
+
     base_out = ["-map", "0:a:0", "-c:a", "pcm_s16le", "-ar", "44100",
                 "-threads", "1", "-y", str(wav_path)]
     base_in  = [ff, "-nostdin", "-v", "warning"]
@@ -380,7 +401,7 @@ def ensure_wav(audio_path: Path) -> Path:
     for i, cmd in enumerate(strategies, 1):
         if wav_path.exists():
             wav_path.unlink(missing_ok=True)
-        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout_sec)
         if r.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 44:
             if i > 1:
                 log("Step 2", f"   ℹ️  使用备用策略 {i} 转换成功")
@@ -739,7 +760,7 @@ def remove_vocals(audio_path: Path, model_name: str,
             output_format  = "WAV",
             mdxc_params    = model_params,
         )
-        log("Step 3", "   加载模型（首次自动下载，后续秒速）...")
+        log("Step 3", "   加载模型（首次需下载约 200MB，请耐心等待）...")
         _separator_instance.load_model(model_name)
         _separator_instance._loaded_model = model_name
 
@@ -803,10 +824,57 @@ def deliver(instrumental: Path, src_path: Path,
     return dest
 
 
+def _cleanup_current_file(src_path: Path):
+    """清理当前失败文件的临时产物，保留 TMP_DIR 中其他文件"""
+    if not TMP_DIR.exists():
+        return
+    stem = safe_name(src_path.stem.split(" - ")[-1] if " - " in src_path.stem else src_path.stem)
+    for f in TMP_DIR.iterdir():
+        # 匹配当前文件名（可能是 .tmp / .flac / .mp3 / .wav 等）
+        if f.stem == stem or f.stem.startswith(stem):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+
+def _check_wav_duration(wav_path: Path, min_seconds: float = 1.0) -> float:
+    """检查 WAV 文件时长，返回秒数。过短则抛出异常。"""
+    try:
+        import soundfile as sf
+        info = sf.info(str(wav_path))
+        duration = info.duration
+    except Exception:
+        # fallback：从文件大小估算（PCM 16-bit 44100Hz stereo ≈ 176KB/s）
+        size = wav_path.stat().st_size
+        duration = max(0, (size - 44)) / (44100 * 2 * 2)
+
+    if duration < min_seconds:
+        raise RuntimeError(
+            f"音频时长仅 {duration:.2f} 秒（最少需要 {min_seconds} 秒），"
+            f"文件可能已损坏或解密偏移不正确。"
+            f"请尝试 NCM_DEBUG=1 运行查看详情。"
+        )
+    return duration
+
+
 # ══════════════════════════════════════════════════════════
 #  主入口
 # ══════════════════════════════════════════════════════════
 def main():
+    # ── 注册退出清理（SIGTERM / 异常退出时也能清理临时文件）──
+    import atexit, signal
+    def _cleanup_tmp():
+        if TMP_DIR.exists():
+            shutil.rmtree(TMP_DIR, ignore_errors=True)
+    atexit.register(_cleanup_tmp)
+    def _sigterm_handler(signum, frame):
+        print("\n\n  ⛔ 收到终止信号，正在清理...")
+        _cleanup_tmp()
+        sys.exit(128 + signum)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGHUP, _sigterm_handler)
+
     print()
     print("  ╔══════════════════════════════════════════════════════════╗")
     print("  ║    音频人声分离  全流程自动化                           ║")
@@ -834,6 +902,10 @@ def main():
                 audio_path, is_ncm, display_name = prepare_audio(src_path)
                 decoded_audio = audio_path if is_ncm else None
 
+                # 检查 WAV 时长，避免过短文件导致分离器 tensor 错误
+                duration = _check_wav_duration(audio_path)
+                dbg("Step 2", f"音频时长: {duration:.1f}s")
+
                 instrumental = remove_vocals(
                     audio_path, model_name, model_params, mode_label
                 )
@@ -848,8 +920,8 @@ def main():
                 log("错误", f"❌ {src_path.name} 处理失败: {e}")
                 import traceback; traceback.print_exc()
                 results_err.append(src_path)
-                shutil.rmtree(TMP_DIR, ignore_errors=True)
-                TMP_DIR.mkdir(parents=True, exist_ok=True)
+                # 只清理当前文件相关的临时文件，不影响其他文件
+                _cleanup_current_file(src_path)
                 continue
 
         if results_ok:

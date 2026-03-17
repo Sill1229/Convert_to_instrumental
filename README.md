@@ -71,7 +71,7 @@ python3 ~/Downloads/Convert_to_instrumental.py
 
 1. 创建虚拟环境 `~/.ncm_venv`（使用 Python 3.11/3.12）
 2. 安装 Python 依赖包（pycryptodome, audio-separator, torch 等）
-3. 下载 AI 分离模型到 `~/.audio_separator_models`
+3. 下载 AI 分离模型到 `~/.audio_separator_models`（约 200MB）
 
 后续运行秒速启动。
 
@@ -196,6 +196,36 @@ macOS Homebrew 上的 ffmpeg 7+ 引入了新的线程模型和更严格的 muxer
 
 **修复**：自动优先使用 Homebrew 安装的 Python 3.11/3.12，在独立 venv 中运行。
 
+### venv 自举无限循环
+
+如果 pip 安装成功返回 0 但实际某个包导入失败（如 torch 下载不完整），`os.execv` 会导致脚本无限重启。
+
+**修复**：通过环境变量 `_NCM_BOOT` 计数重启次数，超过 3 次直接报错退出并提示手动排查命令。
+
+### 单文件失败影响批量处理
+
+失败时 `shutil.rmtree(TMP_DIR)` 会清空整个临时目录，可能误删其他正在处理的文件的临时数据。
+
+**修复**：失败时只清理当前文件相关的临时产物（按文件名匹配），保留 TMP_DIR 中其他文件。
+
+### 过短音频导致 tensor crash
+
+音频时长 < 0.1 秒时，分离模型会报 `The size of tensor a (0) must match the size of tensor b (N)` 然后返回空列表，最终触发 `list index out of range`。
+
+**修复**：分离前用 soundfile 检查 WAV 时长（fallback 按文件大小估算），< 1 秒的文件直接给出明确错误信息，避免 tensor crash。
+
+### ffmpeg 大文件超时
+
+硬编码 `timeout=120` 对 200MB+ 的 FLAC 文件在老机器上可能不够。
+
+**修复**：timeout 按文件大小动态缩放：`max(60, 60 + file_size_MB × 1.2)` 秒。
+
+### 异常退出临时文件残留
+
+SIGTERM / SIGHUP 终止进程时临时文件残留在 `/tmp/ncm_pipeline/`。
+
+**修复**：注册 `atexit` 清理函数 + SIGTERM/SIGHUP 信号处理器，确保任何退出方式都能清理临时目录。
+
 ---
 
 ## 目录结构
@@ -217,10 +247,21 @@ macOS Homebrew 上的 ffmpeg 7+ 引入了新的线程模型和更严格的 muxer
 | `audio-separator` | AI 人声分离引擎（RoFormer 模型） |
 | `onnxruntime` | 推理加速 |
 | `torch` / `torchaudio` | PyTorch 推理 + 音频 I/O fallback |
-| `soundfile` | 音频格式转换 fallback |
+| `soundfile` | 音频格式转换 fallback + WAV 时长检测 |
 | `send2trash` | 安全删除 NCM 原文件到废纸篓 |
 
 所有依赖首次运行时自动安装到 `~/.ncm_venv`。
+
+---
+
+## 已知限制
+
+| 限制 | 说明 |
+|------|------|
+| **仅 macOS** | 使用 AppleScript 弹窗 + Homebrew，不支持 Windows/Linux。核心逻辑跨平台，替换 UI 部分即可适配 |
+| **无文件日志** | 仅控制台输出，可用 `NCM_DEBUG=1` 获取详细诊断。如需持久化日志可重定向: `python3 script.py 2>&1 \| tee log.txt` |
+| **配置硬编码** | 模型参数、输出目录等写死在脚本中，如需自定义需直接修改源码 |
+| **输出仅 WAV** | 分离器输出 WAV 格式，如需 FLAC/MP3 可后续用 ffmpeg 转换 |
 
 ---
 
@@ -232,8 +273,11 @@ macOS Homebrew 上的 ffmpeg 7+ 引入了新的线程模型和更严格的 muxer
 **Q: 弹窗没出现？**
 终端需要辅助功能权限。前往 系统设置 → 隐私与安全 → 辅助功能，添加终端应用。脚本也支持手动拖入文件路径作为降级方案。
 
-**Q: 处理报错 `list index out of range`？**
-分离器未产生输出，通常是音频过短（< 1 秒）或文件损坏。开启 `NCM_DEBUG=1` 查看详情。
+**Q: 报错「音频时长仅 0.05 秒」？**
+NCM 解密偏移可能不正确，导致输出的音频文件几乎为空。开启 `NCM_DEBUG=1` 运行查看详细偏移探测日志，并反馈输出信息。
+
+**Q: 报错「虚拟环境多次重启仍无法加载依赖」？**
+pip 安装可能不完整。按提示执行 `rm -rf ~/.ncm_venv` 后重新运行。如果网络环境受限，可能需要配置 pip 镜像源。
 
 **Q: 支持 Windows / Linux 吗？**
 当前仅支持 macOS（AppleScript 弹窗 + Homebrew）。核心解密和分离逻辑跨平台，替换 UI 交互部分即可适配。
