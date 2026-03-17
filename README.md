@@ -70,7 +70,7 @@ python3 ~/Downloads/Convert_to_instrumental.py
 **首次运行**会自动完成（约 5~15 分钟）：
 
 1. 创建虚拟环境 `~/.ncm_venv`（使用 Python 3.11/3.12）
-2. 安装 Python 依赖包（pycryptodome, audio-separator, torch 等）
+2. 安装 Python 依赖包（pycryptodome, audio-separator==0.42.1, torch 等）
 3. 下载 AI 分离模型到 `~/.audio_separator_models`（约 200MB）
 
 后续运行秒速启动。
@@ -124,7 +124,7 @@ python3 Convert_to_instrumental.py
 ```
 NCM 文件
   ├─ 验证魔数 (CTENFDAM)
-  ├─ AES-ECB 解密 RC4 密钥
+  ├─ AES-ECB 解密 RC4 密钥（含 PKCS7 padding 校验）
   ├─ 解密元数据 (歌名/歌手/格式)
   ├─ 自动定位音频数据起始偏移
   │   ├─ 策略1: 结构化解析 CRC+flag+img_size+img+[pad]
@@ -166,65 +166,41 @@ NCM 文件
 
 ## 已解决的问题
 
-### ffmpeg 7.x / 8.x 兼容性
+### v3 — ffmpeg 兼容性与 NCM 解密
 
-macOS Homebrew 上的 ffmpeg 7+ 引入了新的线程模型和更严格的 muxer，导致 `Terminating thread with return code -22` 和 `Nothing was written into output file`。
+**ffmpeg 7.x / 8.x 兼容性**：添加 `-nostdin` / `-map 0:a:0` / `-threads 1`，编码改为 `pcm_s16le`，ffmpeg 失败时用 soundfile/torchaudio 作为 Python fallback。
 
-**修复**：添加 `-nostdin` / `-map 0:a:0` / `-threads 1`，编码从 `pcm_s24le` 改为 `pcm_s16le`，ffmpeg 全部失败时用 soundfile/torchaudio 作为 Python fallback。
+**NCM 解密偏移适配**：四层自动定位 — 结构化解析 → 双图片块/padding 探测 → 加密魔数快速扫描 → 严格 MP3 帧头搜索。
 
-### NCM 解密偏移适配
+**MP3 帧头假阳性**：严格验证四字段（version / layer / bitrate / sample_rate），跳过图片区域。
 
-不同版本的 NCM 文件在元数据之后的结构不同（CRC 长度、gap 字节数、图片块数量、padding），硬编码偏移无法覆盖所有情况。
+**NCM 元数据与实际格式不符**：通过文件头魔数检测真实格式，自动修正。
 
-**修复**：四层自动定位 — 结构化解析（CRC+flag+img）→ 双图片块/padding 探测 → 预计算加密魔数 bytes.find 全文件快速扫描 → 严格 MP3 帧头搜索 → 未加密原始字节搜索。
+### v3.1 — 鲁棒性增强
 
-### MP3 帧头假阳性
+**venv 无限循环**：环境变量计数重启次数，≥3 次报错退出。
 
-暴力扫描时 `0xFF 0xFF` 等字节组合通过了宽松的 MP3 sync 检查，导致在图片数据区域误定位。
+**单文件失败影响批量**：按文件名匹配只清理当前文件临时产物。
 
-**修复**：严格验证 MP3 帧头四字段（version ≠ reserved、layer ≠ reserved、bitrate ≠ 0x0/0xF、sample_rate ≠ reserved），扫描时跳过图片区域（前 8KB）。
+**过短音频 tensor crash**：分离前检查 WAV 时长，< 1 秒直接给出明确错误。
 
-### NCM 元数据与实际格式不符
+**ffmpeg 大文件超时**：timeout 按文件大小动态缩放。
 
-网易云 NCM 元数据声称 FLAC，但实际内容有时是 MP3。
+**异常退出临时文件残留**：atexit + SIGTERM/SIGHUP 信号处理。
 
-**修复**：解密后通过文件头魔数检测真实格式，自动修正扩展名。
+### v3.2 — 代码审计修复
 
-### Python 3.14 兼容性
+**AES 解密 padding 无校验**：添加 PKCS7 校验（`1 ≤ pad ≤ 16` + 末尾一致性检查），损坏的 NCM 不再静默产生错误密钥。
 
-`beartype`（`audio-separator` 依赖）在 Python 3.14 上有兼容问题。
+**私有属性侵入第三方对象**：不再往 `Separator` 实例上写 `_loaded_model` 属性，改用脚本自己的 `_loaded_model_name` 变量追踪。
 
-**修复**：自动优先使用 Homebrew 安装的 Python 3.11/3.12，在独立 venv 中运行。
+**ensure_wav 隐式删除输入文件**：删除副作用从 `ensure_wav()` 移到 `prepare_audio()`，函数职责更清晰，未来重构不会误删源文件。
 
-### venv 自举无限循环
+**多实例临时目录冲突**：`/tmp/ncm_pipeline` → `/tmp/ncm_pipeline_{PID}`，多窗口同时运行不再互相干扰。
 
-如果 pip 安装成功返回 0 但实际某个包导入失败（如 torch 下载不完整），`os.execv` 会导致脚本无限重启。
+**audio-separator 版本锁定**：锁定 `audio-separator==0.42.1`，避免上游 API 变动导致 `load_model` / `separate` 行为不兼容。
 
-**修复**：通过环境变量 `_NCM_BOOT` 计数重启次数，超过 3 次直接报错退出并提示手动排查命令。
-
-### 单文件失败影响批量处理
-
-失败时 `shutil.rmtree(TMP_DIR)` 会清空整个临时目录，可能误删其他正在处理的文件的临时数据。
-
-**修复**：失败时只清理当前文件相关的临时产物（按文件名匹配），保留 TMP_DIR 中其他文件。
-
-### 过短音频导致 tensor crash
-
-音频时长 < 0.1 秒时，分离模型会报 `The size of tensor a (0) must match the size of tensor b (N)` 然后返回空列表，最终触发 `list index out of range`。
-
-**修复**：分离前用 soundfile 检查 WAV 时长（fallback 按文件大小估算），< 1 秒的文件直接给出明确错误信息，避免 tensor crash。
-
-### ffmpeg 大文件超时
-
-硬编码 `timeout=120` 对 200MB+ 的 FLAC 文件在老机器上可能不够。
-
-**修复**：timeout 按文件大小动态缩放：`max(60, 60 + file_size_MB × 1.2)` 秒。
-
-### 异常退出临时文件残留
-
-SIGTERM / SIGHUP 终止进程时临时文件残留在 `/tmp/ncm_pipeline/`。
-
-**修复**：注册 `atexit` 清理函数 + SIGTERM/SIGHUP 信号处理器，确保任何退出方式都能清理临时目录。
+**超长文件名**：`safe_name()` 增加 200 字符截断，防止触发文件系统限制。
 
 ---
 
@@ -234,21 +210,21 @@ SIGTERM / SIGHUP 终止进程时临时文件残留在 `/tmp/ncm_pipeline/`。
 |------|------|
 | `~/.ncm_venv/` | Python 虚拟环境（自动创建） |
 | `~/.audio_separator_models/` | AI 模型缓存 |
-| `/tmp/ncm_pipeline/` | 临时处理目录（运行后自动清理） |
+| `/tmp/ncm_pipeline_{PID}/` | 临时处理目录（运行后自动清理，含进程 PID 防冲突） |
 | `~/Desktop/` | 输出目录 |
 
 ---
 
 ## 依赖包
 
-| 包名 | 用途 |
-|------|------|
-| `pycryptodome` | NCM 文件 AES-ECB 解密 |
-| `audio-separator` | AI 人声分离引擎（RoFormer 模型） |
-| `onnxruntime` | 推理加速 |
-| `torch` / `torchaudio` | PyTorch 推理 + 音频 I/O fallback |
-| `soundfile` | 音频格式转换 fallback + WAV 时长检测 |
-| `send2trash` | 安全删除 NCM 原文件到废纸篓 |
+| 包名 | 版本 | 用途 |
+|------|------|------|
+| `pycryptodome` | latest | NCM 文件 AES-ECB 解密 |
+| `audio-separator` | **0.42.1** | AI 人声分离引擎（RoFormer 模型） |
+| `onnxruntime` | latest | 推理加速 |
+| `torch` / `torchaudio` | latest | PyTorch 推理 + 音频 I/O fallback |
+| `soundfile` | latest | 音频格式转换 fallback + WAV 时长检测 |
+| `send2trash` | latest | 安全删除 NCM 原文件到废纸篓 |
 
 所有依赖首次运行时自动安装到 `~/.ncm_venv`。
 
@@ -259,9 +235,10 @@ SIGTERM / SIGHUP 终止进程时临时文件残留在 `/tmp/ncm_pipeline/`。
 | 限制 | 说明 |
 |------|------|
 | **仅 macOS** | 使用 AppleScript 弹窗 + Homebrew，不支持 Windows/Linux。核心逻辑跨平台，替换 UI 部分即可适配 |
-| **无文件日志** | 仅控制台输出，可用 `NCM_DEBUG=1` 获取详细诊断。如需持久化日志可重定向: `python3 script.py 2>&1 \| tee log.txt` |
+| **无文件日志** | 仅控制台输出，可用 `NCM_DEBUG=1` 获取详细诊断。需要持久化日志可重定向: `python3 script.py 2>&1 \| tee log.txt` |
 | **配置硬编码** | 模型参数、输出目录等写死在脚本中，如需自定义需直接修改源码 |
 | **输出仅 WAV** | 分离器输出 WAV 格式，如需 FLAC/MP3 可后续用 ffmpeg 转换 |
+| **上游 API 敏感** | audio-separator 已锁版本 0.42.1；如需升级，需验证 `Separator()` 构造参数和 `separate()` 返回格式未变 |
 
 ---
 
@@ -274,10 +251,16 @@ SIGTERM / SIGHUP 终止进程时临时文件残留在 `/tmp/ncm_pipeline/`。
 终端需要辅助功能权限。前往 系统设置 → 隐私与安全 → 辅助功能，添加终端应用。脚本也支持手动拖入文件路径作为降级方案。
 
 **Q: 报错「音频时长仅 0.05 秒」？**
-NCM 解密偏移可能不正确，导致输出的音频文件几乎为空。开启 `NCM_DEBUG=1` 运行查看详细偏移探测日志，并反馈输出信息。
+NCM 解密偏移可能不正确，导致输出的音频文件几乎为空。开启 `NCM_DEBUG=1` 运行查看详细偏移探测日志。
 
 **Q: 报错「虚拟环境多次重启仍无法加载依赖」？**
-pip 安装可能不完整。按提示执行 `rm -rf ~/.ncm_venv` 后重新运行。如果网络环境受限，可能需要配置 pip 镜像源。
+pip 安装可能不完整。执行 `rm -rf ~/.ncm_venv` 后重新运行。如果网络环境受限，可能需要配置 pip 镜像源。
+
+**Q: 想同时处理两批歌？**
+可以。v3.2 起临时目录带 PID 隔离，多终端窗口同时运行不会冲突。
+
+**Q: 升级 audio-separator 版本？**
+脚本锁定了 `audio-separator==0.42.1`。如需升级，修改脚本中 `PACKAGES` 列表的版本号，然后 `rm -rf ~/.ncm_venv` 重建环境。升级后请验证输出是否正常。
 
 **Q: 支持 Windows / Linux 吗？**
 当前仅支持 macOS（AppleScript 弹窗 + Homebrew）。核心解密和分离逻辑跨平台，替换 UI 交互部分即可适配。

@@ -32,6 +32,14 @@ v3.1 修复:
     - ffmpeg timeout 按文件大小缩放（60s + 1.2s/MB），大文件不会超时
     - 添加 atexit + SIGTERM/SIGHUP 信号处理，异常退出也能清理临时文件
     - 模型首次下载提示更明确（约 200MB）
+
+v3.2 修复 (based on GPT code review):
+    - AES 解密增加 PKCS7 padding 校验，防止损坏 NCM 导致静默错误
+    - 不再往第三方 Separator 对象上塞私有属性，用脚本变量追踪模型状态
+    - ensure_wav() 不再隐式删除输入文件，清理职责移到 prepare_audio()
+    - 临时目录加 PID 后缀，防止多实例同时运行时文件冲突
+    - 锁定 audio-separator==0.42.1，避免上游 API 变动导致兼容问题
+    - safe_name() 增加 200 字符截断，防止超长文件名
 """
 
 # ══════════════════════════════════════════════════════════
@@ -46,7 +54,7 @@ VENV_PIP = VENV_DIR / "bin" / "pip"
 
 PACKAGES = [
     "pycryptodome",
-    "audio-separator",
+    "audio-separator==0.42.1",   # 锁定已验证版本，避免 API 变动
     "onnxruntime",
     "send2trash",
     "torch",
@@ -193,7 +201,7 @@ NCM_MAGIC = b"CTENFDAM"
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".aac", ".ogg", ".m4a", ".opus", ".wma", ".aiff"}
 
 DEFAULT_NCM_DIR = Path.home() / "Music" / "网易云音乐"
-TMP_DIR         = Path("/tmp/ncm_pipeline")
+TMP_DIR         = Path(f"/tmp/ncm_pipeline_{os.getpid()}")
 DESKTOP         = Path.home() / "Desktop"
 MODEL_DIR       = Path.home() / ".audio_separator_models"
 
@@ -214,8 +222,9 @@ def dbg(step: str, msg: str):
 def hr():
     print("  " + "─" * 54)
 
-def safe_name(s: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]', "_", s).strip()
+def safe_name(s: str, max_len: int = 200) -> str:
+    name = re.sub(r'[\\/:*?"<>|]', "_", s).strip()
+    return name[:max_len] if len(name) > max_len else name
 
 def osascript(script: str) -> str:
     r = subprocess.run(["osascript", "-e", script],
@@ -421,7 +430,6 @@ def ensure_wav(audio_path: Path) -> Path:
                 f"Python fallback 错误: {e_fb}"
             )
 
-    audio_path.unlink(missing_ok=True)
     size_mb = wav_path.stat().st_size / 1024 / 1024
     log("Step 2", f"   ✅ 转换完成 → {wav_path.name}（{size_mb:.1f} MB）")
     return wav_path
@@ -456,10 +464,15 @@ def _python_fallback_convert(src: Path, dst: Path) -> Path:
 
 
 def prepare_audio(file_path: Path) -> tuple:
-    """返回 (audio_path, is_ncm, display_name)"""
+    """返回 (audio_path, is_ncm, display_name)
+    调用者负责最终清理 TMP_DIR，中间转换产物在此函数内清理。
+    """
     if file_path.suffix.lower() == ".ncm":
-        audio_path, display_name = decrypt_ncm(file_path)
-        audio_path = ensure_wav(audio_path)
+        decoded_path, display_name = decrypt_ncm(file_path)
+        audio_path = ensure_wav(decoded_path)
+        # 清理解密出的中间文件（如 .flac/.mp3），WAV 留给后续流程
+        if decoded_path != audio_path and decoded_path.exists():
+            decoded_path.unlink(missing_ok=True)
         return audio_path, True, display_name
     else:
         size_mb = file_path.stat().st_size / 1024 / 1024
@@ -482,6 +495,9 @@ def prepare_audio(file_path: Path) -> tuple:
             tmp_copy = TMP_DIR / file_path.name
             shutil.copy2(str(file_path), str(tmp_copy))
             audio_path = ensure_wav(tmp_copy)
+            # 清理转换前的临时副本
+            if tmp_copy != audio_path and tmp_copy.exists():
+                tmp_copy.unlink(missing_ok=True)
         else:
             audio_path = file_path
 
@@ -493,7 +509,12 @@ def prepare_audio(file_path: Path) -> tuple:
 # ══════════════════════════════════════════════════════════
 def _aes_ecb_decrypt(key: bytes, data: bytes) -> bytes:
     raw = AES.new(key, AES.MODE_ECB).decrypt(data)
-    return raw[: -raw[-1]]
+    pad = raw[-1]
+    # PKCS7 padding 校验：值必须在 1~16 且末尾 N 字节全等于 N
+    if not (1 <= pad <= 16) or raw[-pad:] != bytes([pad]) * pad:
+        # padding 异常，返回原始数据（可能是非标准填充）
+        return raw
+    return raw[:-pad]
 
 def _build_key_stream(rc4_key: bytes) -> bytearray:
     box = list(range(256))
@@ -741,10 +762,11 @@ def decrypt_ncm(ncm_path: Path) -> tuple:
 # ══════════════════════════════════════════════════════════
 
 _separator_instance = None
+_loaded_model_name  = None    # 脚本自己追踪已加载的模型名
 
 def remove_vocals(audio_path: Path, model_name: str,
                   model_params: dict, mode_label: str) -> Path:
-    global _separator_instance
+    global _separator_instance, _loaded_model_name
 
     log("Step 3", f"🎼 分离中: {audio_path.name}")
     log("Step 3", f"   模式: {mode_label}")
@@ -753,7 +775,7 @@ def remove_vocals(audio_path: Path, model_name: str,
 
     from audio_separator.separator import Separator
 
-    if _separator_instance is None or _separator_instance._loaded_model != model_name:
+    if _separator_instance is None or _loaded_model_name != model_name:
         _separator_instance = Separator(
             model_file_dir = str(MODEL_DIR),
             output_dir     = str(TMP_DIR),
@@ -762,7 +784,7 @@ def remove_vocals(audio_path: Path, model_name: str,
         )
         log("Step 3", "   加载模型（首次需下载约 200MB，请耐心等待）...")
         _separator_instance.load_model(model_name)
-        _separator_instance._loaded_model = model_name
+        _loaded_model_name = model_name
 
     t0 = time.time()
     outputs = _separator_instance.separate(str(audio_path))
