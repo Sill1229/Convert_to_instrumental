@@ -3,7 +3,7 @@
 """
 ╔══════════════════════════════════════════════════════════╗
 ║    音频人声分离全流程自动化脚本                          ║
-║    NCM / WAV / FLAC / MP3 → RoFormer → 桌面输出        ║
+║    NCM / WAV / FLAC / MP3 → RoFormer → 48k/24bit桌面输出║
 ╚══════════════════════════════════════════════════════════╝
 
 支持输入格式：
@@ -19,7 +19,7 @@ macOS Tahoe 26.3 / Homebrew Python 3.14 兼容（无需 tkinter）
 venv 使用 Python 3.11/3.12，规避 beartype 兼容问题
 
 v3  修复:
-    - ffmpeg 7.x/8.x 兼容 (-nostdin / -map 0:a:0 / -threads 1 / pcm_s16le)
+    - ffmpeg 7.x/8.x 兼容 (-nostdin / -map 0:a:0 / -threads 1 / pcm_s24le)
     - NCM 解密偏移自动探测（结构化解析 + padding 探测 + 全文件扫描）
     - soundfile / torchaudio 作为格式转换 fallback
     - 严格 MP3 帧头验证，排除假阳性
@@ -38,7 +38,7 @@ v3.2 修复 (based on GPT code review):
     - 不再往第三方 Separator 对象上塞私有属性，用脚本变量追踪模型状态
     - ensure_wav() 不再隐式删除输入文件，清理职责移到 prepare_audio()
     - 临时目录加 PID 后缀，防止多实例同时运行时文件冲突
-    - 锁定 audio-separator==0.42.1，避免上游 API 变动导致兼容问题
+    - audio-separator 不再锁定版本，跟随上游最新
     - safe_name() 增加 200 字符截断，防止超长文件名
 
 v3.3 融合优化 (best of Claude + GPT):
@@ -50,6 +50,12 @@ v3.3 融合优化 (best of Claude + GPT):
     - TMP_DIR 加时间戳+PID+tempfile.gettempdir()，可读性更好
     - _find_audio_start 结构解析加 len(raw_hdr) 安全检查
     - 设置 NCM_DEBUG=1 查看详细诊断信息
+
+v3.4 管线升级:
+    - audio-separator 解锁版本，跟随最新上游
+    - 输出格式升级为 48kHz 24-bit WAV（符合制作流程标准）
+    - 中间转换和最终输出均保证 48k/24bit 规格
+    - deliver() 增加 _ensure_48k_24bit() 后处理保障
 """
 
 # ══════════════════════════════════════════════════════════
@@ -64,7 +70,7 @@ VENV_PIP = VENV_DIR / "bin" / "pip"
 
 PACKAGES = [
     "pycryptodome",
-    "audio-separator==0.42.1",   # 锁定已验证版本，避免 API 变动
+    "audio-separator",            # 升级至最新版，支持更多模型
     "onnxruntime",
     "send2trash",
     "torch",
@@ -411,7 +417,7 @@ def ensure_wav(audio_path: Path, delete_source: bool = False) -> Path:
     file_size_mb = audio_path.stat().st_size / 1024 / 1024
     timeout_sec = max(60, int(60 + file_size_mb * 1.2))
 
-    base_out = ["-map", "0:a:0", "-c:a", "pcm_s16le", "-ar", "44100",
+    base_out = ["-map", "0:a:0", "-c:a", "pcm_s24le", "-ar", "48000",
                 "-threads", "1", "-y", str(wav_path)]
     base_in  = [ff, "-nostdin", "-v", "warning"]
 
@@ -462,7 +468,7 @@ def _python_fallback_convert(src: Path, dst: Path) -> Path:
     try:
         import soundfile as sf
         data, sr = sf.read(str(src))
-        sf.write(str(dst), data, sr, subtype="PCM_16")
+        sf.write(str(dst), data, sr, subtype="PCM_24")
         if dst.exists() and dst.stat().st_size > 44:
             log("Step 2", "   ✅ 通过 soundfile 转换成功")
             return dst
@@ -475,7 +481,7 @@ def _python_fallback_convert(src: Path, dst: Path) -> Path:
         import torchaudio
         waveform, sr = torchaudio.load(str(src))
         torchaudio.save(str(dst), waveform, sr,
-                        encoding="PCM_S", bits_per_sample=16)
+                        encoding="PCM_S", bits_per_sample=24)
         if dst.exists() and dst.stat().st_size > 44:
             log("Step 2", "   ✅ 通过 torchaudio 转换成功")
             return dst
@@ -875,11 +881,47 @@ def remove_vocals(audio_path: Path, model_name: str,
 # ══════════════════════════════════════════════════════════
 #  Step 4 — 收尾：重命名 + 移桌面 + 处理原文件
 # ══════════════════════════════════════════════════════════
+def _ensure_48k_24bit(wav_path: Path) -> Path:
+    """确保最终输出为 48kHz 24-bit WAV（分离器可能输出其他规格）"""
+    try:
+        import soundfile as sf
+        info = sf.info(str(wav_path))
+        need_convert = (info.samplerate != 48000
+                        or info.subtype != "PCM_24")
+    except Exception:
+        need_convert = True
+
+    if not need_convert:
+        return wav_path
+
+    log("Step 4", "   🔄 转换输出为 48kHz 24-bit WAV...")
+    ff = _find_ffmpeg()
+    out_path = wav_path.with_suffix(".48k24.wav")
+    r = subprocess.run(
+        [ff, "-nostdin", "-v", "warning",
+         "-i", str(wav_path),
+         "-c:a", "pcm_s24le", "-ar", "48000",
+         "-threads", "1", "-y", str(out_path)],
+        capture_output=True, timeout=300,
+    )
+    if r.returncode == 0 and out_path.exists() and out_path.stat().st_size > 44:
+        wav_path.unlink(missing_ok=True)
+        out_path.rename(wav_path)
+        log("Step 4", "   ✅ 已转换为 48kHz 24-bit")
+    else:
+        out_path.unlink(missing_ok=True)
+        log("Step 4", "   ⚠️  格式转换失败，保留原始输出")
+    return wav_path
+
+
 def deliver(instrumental: Path, src_path: Path,
             decoded_audio, is_ncm: bool,
             display_name: str, output_suffix: str) -> Path:
 
     DESKTOP.mkdir(exist_ok=True)
+
+    # 确保输出规格为 48kHz 24-bit
+    instrumental = _ensure_48k_24bit(instrumental)
 
     final_name = f"{display_name}{output_suffix}.wav"
     dest = DESKTOP / final_name
@@ -922,9 +964,9 @@ def _check_wav_duration(wav_path: Path, min_seconds: float = 1.0) -> float:
         info = sf.info(str(wav_path))
         duration = info.duration
     except Exception:
-        # fallback：从文件大小估算（PCM 16-bit 44100Hz stereo ≈ 176KB/s）
+        # fallback：从文件大小估算（PCM 24-bit 48000Hz stereo ≈ 288KB/s）
         size = wav_path.stat().st_size
-        duration = max(0, (size - 44)) / (44100 * 2 * 2)
+        duration = max(0, (size - 44)) / (48000 * 3 * 2)
 
     if duration < min_seconds:
         raise RuntimeError(

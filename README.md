@@ -2,6 +2,8 @@
 
 一键完成网易云 NCM 解密 → 格式转换 → AI 人声分离 → 输出伴奏/卡拉OK，支持批量处理。
 
+现已提供 **macOS .app**，双击即可使用，无需命令行。
+
 ---
 
 ## 功能概览
@@ -13,7 +15,7 @@
 | **两种分离模式** | ① 纯伴奏（去除全部人声）② 保留和声（只去主唱，保留和声） |
 | **批量处理** | 弹窗多选文件，逐首处理并实时显示进度 |
 | **全自动环境** | 首次运行自动创建 venv、安装依赖、下载模型，零手动配置 |
-| **桌面输出** | 处理完成的文件自动保存到桌面，命名格式：`歌手-歌名_(Instrumental).wav` |
+| **48kHz / 24-bit 输出** | 制作级 WAV 品质，自动保存到桌面 |
 | **NCM 清理** | 解密成功后自动将 .ncm 原文件移至废纸篓 |
 
 ### AI 分离模型
@@ -37,39 +39,33 @@
 
 ## 安装与运行
 
-### 1. 安装 Homebrew（如已安装跳过）
+### 方式 A：双击 .app（推荐）
+
+1. 打开 `音频人声分离.app`
+2. 首次打开可能需要：右键 → 打开（绕过 Gatekeeper）
+3. 自动在终端中启动，按弹窗提示操作即可
+
+> ⚠️ 首次运行会自动安装环境（约 5~15 分钟），后续秒速启动。
+
+### 方式 B：命令行运行
 
 ```bash
+# 1. 安装 Homebrew（如已安装跳过）
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
 
-### 2. 安装 Python 3.11（推荐）
-
-```bash
+# 2. 安装 Python 3.11（推荐）
 brew install python@3.11
-```
 
-### 3. 安装 ffmpeg（可选，脚本会自动安装）
-
-```bash
+# 3. 安装 ffmpeg（可选，脚本会自动安装）
 brew install ffmpeg
+
+# 4. 运行
+python3 Convert_to_instrumental.py
 ```
-
-### 4. 运行
-
-```bash
-python3 ~/Downloads/Convert_to_instrumental.py
-```
-
-**首次运行**会自动完成（约 5~15 分钟）：创建虚拟环境、安装依赖包（含 `audio-separator==0.42.1`）、下载 AI 模型（约 200MB）。后续运行秒速启动。
 
 ---
 
 ## 使用方法
-
-```bash
-python3 Convert_to_instrumental.py
-```
 
 1. **选择模式** — 弹窗选择「纯伴奏」或「保留和声」
 2. **选择文件** — 弹窗选择一个或多个音频文件（按住 ⌘ 多选）
@@ -79,7 +75,7 @@ python3 Convert_to_instrumental.py
 ### 输出
 
 - 纯伴奏：`歌手-歌名_(Instrumental).wav` / 保留和声：`歌手-歌名_(Karaoke).wav`
-- 格式：WAV PCM 16-bit 44100Hz，输出到 `~/Desktop/`
+- 格式：**WAV PCM 24-bit 48000Hz**，输出到 `~/Desktop/`
 
 ### 调试 / 重建
 
@@ -95,8 +91,8 @@ rm -rf ~/.ncm_venv && python3 Convert_to_instrumental.py   # 重建环境
 ```
 ┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌───────────────┐
 │  Step 1      │    │  Step 2      │    │  Step 3     │    │  Step 4       │
-│  选择文件    │ →  │  解密/转换   │ →  │  AI 分离    │ →  │  输出到桌面   │
-│  (弹窗多选)  │    │  NCM → WAV   │    │  RoFormer   │    │  清理临时文件 │
+│  选择文件    │ →  │  解密/转换   │ →  │  AI 分离    │ →  │  48k/24bit    │
+│  (弹窗多选)  │    │  NCM → WAV   │    │  RoFormer   │    │  输出到桌面   │
 └─────────────┘    └──────────────┘    └─────────────┘    └───────────────┘
 ```
 
@@ -115,13 +111,13 @@ NCM 文件
   └─ 魔数检测真实格式（修正元数据不准）
 ```
 
-### 格式转换 (→ WAV)
+### 格式转换 (→ 48kHz 24-bit WAV)
 
 ```
 输入文件 (FLAC/MP3/...)
   ├─ ffprobe 探测 (codec/采样率/声道/位深)
-  ├─ ffmpeg 多策略转换 (6种, timeout 按文件大小缩放)
-  └─ Python fallback (soundfile → torchaudio)
+  ├─ ffmpeg 多策略转换 (6种, pcm_s24le 48kHz, timeout 按文件大小缩放)
+  └─ Python fallback (soundfile PCM_24 → torchaudio 24-bit)
 ```
 
 ### 伴奏识别（评分机制）
@@ -134,9 +130,23 @@ NCM 文件
   └─ 取最高分 → 伴奏轨
 ```
 
+### 输出后处理
+
+```
+分离器输出 → _ensure_48k_24bit() → 48kHz 24-bit WAV → ~/Desktop/
+```
+
 ---
 
 ## 版本历史
+
+### v3.4 — 管线升级
+
+- audio-separator 解锁版本，跟随最新上游
+- 输出格式升级为 **48kHz 24-bit WAV**（符合制作流程标准）
+- 中间转换和最终输出均保证 48k/24bit 规格
+- `deliver()` 增加 `_ensure_48k_24bit()` 后处理保障
+- 新增 **macOS .app** 打包，双击即用
 
 ### v3.3 — 融合优化 (Claude × GPT)
 
@@ -176,6 +186,8 @@ NCM 文件
 
 | 路径 | 说明 |
 |------|------|
+| `音频人声分离.app` | macOS 应用（双击运行） |
+| `Convert_to_instrumental.py` | Python 脚本（命令行运行） |
 | `~/.ncm_venv/` | Python 虚拟环境（自动创建） |
 | `~/.audio_separator_models/` | AI 模型缓存 |
 | `/tmp/ncm_pipeline_{时间}_{PID}/` | 临时目录（自动清理，带时间戳和 PID 防冲突） |
@@ -188,11 +200,34 @@ NCM 文件
 | 包名 | 版本 | 用途 |
 |------|------|------|
 | `pycryptodome` | latest | NCM 文件 AES-ECB 解密 |
-| `audio-separator` | **0.42.1** | AI 人声分离引擎（RoFormer 模型） |
+| `audio-separator` | **latest** | AI 人声分离引擎（RoFormer 模型） |
 | `onnxruntime` | latest | 推理加速 |
 | `torch` / `torchaudio` | latest | PyTorch 推理 + 音频 I/O fallback |
 | `soundfile` | latest | 格式转换 fallback + WAV 时长检测 |
 | `send2trash` | latest | 安全删除 NCM 原文件到废纸篓 |
+
+---
+
+## .app 打包说明
+
+`音频人声分离.app` 是一个标准的 macOS Application Bundle：
+
+```
+音频人声分离.app/
+  Contents/
+    Info.plist            # 应用元数据
+    MacOS/
+      launcher            # Bash 启动器 → 在 Terminal 中运行 Python 脚本
+    Resources/
+      Convert_to_instrumental.py  # 完整的分离脚本
+      AppIcon.icns        # 应用图标
+```
+
+更新脚本后需同步更新 .app 内的副本：
+
+```bash
+cp Convert_to_instrumental.py 音频人声分离.app/Contents/Resources/
+```
 
 ---
 
@@ -202,13 +237,14 @@ NCM 文件
 |------|------|
 | **仅 macOS** | 使用 AppleScript 弹窗 + Homebrew。核心逻辑跨平台，替换 UI 部分即可适配 |
 | **输出仅 WAV** | 如需 FLAC/MP3 可后续用 ffmpeg 转换 |
-| **上游 API 敏感** | audio-separator 已锁版本 0.42.1；升级需验证 API 兼容性 |
 
 ---
 
 ## FAQ
 
 **Q: 首次运行很慢？** 正常，需安装 PyTorch（~2GB）和下载 AI 模型（~200MB）。
+
+**Q: .app 打开提示「无法验证开发者」？** 右键 .app → 打开，在弹窗中选「打开」。或在系统设置 → 隐私与安全 → 允许。
 
 **Q: 弹窗没出现？** 系统设置 → 隐私与安全 → 辅助功能，添加终端应用。也支持手动拖文件。
 
@@ -218,4 +254,10 @@ NCM 文件
 
 **Q: 同时处理两批？** 可以。临时目录带时间戳+PID 隔离，多终端窗口不冲突。
 
-**Q: 升级 audio-separator？** 改 `PACKAGES` 里的版本号，`rm -rf ~/.ncm_venv` 重建，验证输出正常。
+**Q: 升级模型？** 修改脚本中的 `MODEL_FULL_INST` 或 `MODEL_KARAOKE` 常量，`rm -rf ~/.ncm_venv ~/.audio_separator_models` 重建。
+
+**Q: 能否改变 .app 的存放路径？** 可以。.app 是自包含的 bundle，内部通过相对路径定位脚本，放在桌面、应用程序文件夹、U盘、任何位置都能正常运行。
+
+**Q: 能否重命名 .app？** 可以。macOS 应用的可执行文件由 `Info.plist` 中的 `CFBundleExecutable` 决定（指向内部的 `launcher`），与 .app 外层文件夹名无关。随意改名不影响运行。
+
+**Q: 发给别人的 Mac 能直接用吗？** 可以，前提是对方已安装 Homebrew 和 Python 3.11/3.12。脚本首次运行会自动完成剩余配置（创建 venv、安装依赖、下载模型、安装 ffmpeg）。首次打开需右键 → 打开以绕过 Gatekeeper。
