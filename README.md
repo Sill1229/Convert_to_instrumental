@@ -41,7 +41,7 @@
 
 ### 方式 A：双击 .app（推荐）
 
-1. 打开 `音频人声分离.app`
+1. 打开 `Convert_to_instrumental.app`
 2. 首次打开可能需要：右键 → 打开（绕过 Gatekeeper）
 3. 自动在终端中启动，按弹窗提示操作即可
 
@@ -186,7 +186,7 @@ NCM 文件
 
 | 路径 | 说明 |
 |------|------|
-| `音频人声分离.app` | macOS 应用（双击运行） |
+| `Convert_to_instrumental.app` | macOS 应用（双击运行） |
 | `Convert_to_instrumental.py` | Python 脚本（命令行运行） |
 | `~/.ncm_venv/` | Python 虚拟环境（自动创建） |
 | `~/.audio_separator_models/` | AI 模型缓存 |
@@ -210,10 +210,10 @@ NCM 文件
 
 ## .app 打包说明
 
-`音频人声分离.app` 是一个标准的 macOS Application Bundle：
+`Convert_to_instrumental.app` 是一个标准的 macOS Application Bundle：
 
 ```
-音频人声分离.app/
+Convert_to_instrumental.app/
   Contents/
     Info.plist            # 应用元数据
     MacOS/
@@ -226,7 +226,7 @@ NCM 文件
 更新脚本后需同步更新 .app 内的副本：
 
 ```bash
-cp Convert_to_instrumental.py 音频人声分离.app/Contents/Resources/
+cp Convert_to_instrumental.py Convert_to_instrumental.app/Contents/Resources/
 ```
 
 ---
