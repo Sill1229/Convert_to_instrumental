@@ -87,6 +87,13 @@ PREFERRED_PYTHONS = [
     shutil.which("python3.12") or "",
 ]
 
+def _brew_path() -> str:
+    """找到 brew 可执行文件路径，找不到返回空字符串"""
+    for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
+        if Path(p).exists():
+            return p
+    return shutil.which("brew") or ""
+
 def find_compatible_python() -> str:
     for p in PREFERRED_PYTHONS:
         if p and Path(p).exists():
@@ -94,6 +101,48 @@ def find_compatible_python() -> str:
     if sys.version_info >= (3, 14):
         print("\n  ⚠️  未找到 Python 3.11/3.12，当前 3.14 可能有兼容问题。")
         print("     建议：brew install python@3.11  然后 rm -rf ~/.ncm_venv\n")
+    return sys.executable
+
+def ensure_python311() -> str:
+    """
+    确保系统有可用的 Python 3.10+。
+    若只有系统 Python 3.9，自动通过 Homebrew 安装 3.11。
+    返回可用的 Python 路径。
+    """
+    import time
+    ts = lambda: time.strftime("%H:%M:%S")
+
+    # 已有合适版本，直接返回
+    for p in PREFERRED_PYTHONS:
+        if p and Path(p).exists():
+            return p
+
+    # 当前 Python 已经 >= 3.10，直接用
+    if sys.version_info >= (3, 10):
+        return sys.executable
+
+    # 需要安装 Python 3.11
+    brew = _brew_path()
+    if not brew:
+        print(f"\n  [{ts()}] [警告] ⚠️  未找到 Homebrew，无法自动安装 Python 3.11。")
+        print(f"  [{ts()}] [警告]    「纯伴奏」模式可正常使用。")
+        print(f"  [{ts()}] [警告]    如需「保留和声」，请先安装 Homebrew：https://brew.sh")
+        return sys.executable
+
+    print(f"\n  [{ts()}] [安装] 检测到系统 Python 版本过低（{sys.version.split()[0]}）")
+    print(f"  [{ts()}] [安装] 正在通过 Homebrew 自动安装 Python 3.11（约 2-5 分钟）...")
+    try:
+        subprocess.check_call([brew, "install", "python@3.11"])
+    except subprocess.CalledProcessError:
+        print(f"  [{ts()}] [警告] Python 3.11 安装失败，将使用系统 Python（保留和声模式不可用）")
+        return sys.executable
+
+    # 安装后再找一次
+    for p in PREFERRED_PYTHONS:
+        if p and Path(p).exists():
+            print(f"  [{ts()}] [安装] ✅ Python 3.11 安装完成：{p}")
+            return p
+
     return sys.executable
 
 def _in_venv() -> bool:
@@ -155,7 +204,8 @@ def bootstrap_and_relaunch():
         if VENV_DIR.exists():
             print(f"\n  [{ts()}] [安装] 检测到旧 venv，重建中...")
             shutil.rmtree(VENV_DIR)
-        base_py = find_compatible_python()
+        # 优先使用 Python 3.11+，不够则自动通过 Homebrew 安装
+        base_py = ensure_python311()
         ver_out = subprocess.run([base_py, "--version"],
                                  capture_output=True, text=True).stdout.strip()
         print(f"\n  [{ts()}] [安装] 创建虚拟环境（{ver_out}）: {VENV_DIR}")
@@ -1071,6 +1121,26 @@ def main():
                 # 注意：此处不能 os.execv，因为：
                 #   bootstrap 阶段的 _fix_samplerate() 通常已处理，此处作最终兜底。
                 #   不删整个 venv，直接卸掉 samplerate，下次启动 bootstrap 无需重装其他包。
+                # 模型不在当前版本支持列表：通常是 Python 3.9 装了旧版 audio-separator
+                if "not found in supported model files" in err_str:
+                    print()
+                    print("  ╔══════════════════════════════════════════════════════════╗")
+                    print("  ║  ❌  「保留和声」模式不支持（Python 版本过低）         ║")
+                    print("  ╚══════════════════════════════════════════════════════════╝")
+                    print()
+                    print("  原因：当前 Python < 3.10，只能安装 audio-separator 旧版本，")
+                    print("        旧版本不包含卡拉OK模型。")
+                    print()
+                    print("  解决方法（终端运行以下两条命令）：")
+                    print()
+                    print("    brew install python@3.11")
+                    print(f"    rm -rf {VENV_DIR}")
+                    print()
+                    print("  重新打开 App 后将自动使用 Python 3.11 重建环境，")
+                    print("  「保留和声」模式即可正常使用。")
+                    print()
+                    results_err.append(src_path)
+                    continue
                 if "incompatible architecture" in err_str and "arm64" in err_str:
                     print()
                     print("  ╔══════════════════════════════════════════════════════════╗")
