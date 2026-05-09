@@ -286,6 +286,14 @@ import struct, json, base64, re, time, tempfile
 from Crypto.Cipher import AES
 from send2trash import send2trash
 
+# ── 清除代理环境变量 ──────────────────────────────────────
+# Privoxy 等系统代理损坏时会导致 pip、requests（模型下载）全部失败。
+# 在 venv 入口处统一清掉，所有后续网络操作直连，不受坏代理影响。
+for _proxy_key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                    "all_proxy", "ALL_PROXY"]:
+    os.environ.pop(_proxy_key, None)
+del _proxy_key
+
 
 # ══════════════════════════════════════════════════════════
 #  0-C  ffmpeg 检测与自动安装
