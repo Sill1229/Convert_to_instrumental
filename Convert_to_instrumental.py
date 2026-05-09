@@ -105,12 +105,38 @@ def _in_venv() -> bool:
         return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
 def _venv_has_packages() -> bool:
+    """检查 venv 核心包是否可加载（不含 samplerate，它单独处理）"""
     r = subprocess.run(
         [str(VENV_PY), "-c",
-         "import Crypto, audio_separator, onnxruntime, send2trash, torch, torchaudio, soundfile"],
+         "import Crypto, audio_separator, onnxruntime, send2trash, "
+         "torch, torchaudio, soundfile"],
         capture_output=True,
     )
     return r.returncode == 0
+
+def _fix_samplerate():
+    """
+    samplerate 在某些 Mac 上 pip 始终装 x86_64 wheel，导致 arm64 上无法加载。
+    librosa 检测到 samplerate 不可用时会自动降级用 scipy 重采样，功能不受影响。
+    策略：已安装但加载失败 → 卸载；未安装 / 加载正常 → 静默跳过。
+    """
+    # 先检查是否已安装，未安装直接跳过（避免每次都弹提示）
+    r_installed = subprocess.run(
+        [str(VENV_PY), "-c",
+         "import importlib.util; exit(0 if importlib.util.find_spec('samplerate') else 1)"],
+        capture_output=True,
+    )
+    if r_installed.returncode != 0:
+        return  # 未安装，无需处理
+
+    # 已安装，测试能否正常加载
+    r_load = subprocess.run([str(VENV_PY), "-c", "import samplerate"],
+                            capture_output=True)
+    if r_load.returncode != 0:
+        print("  [修复] ⚠️  samplerate 动态库架构不兼容，正在卸载...")
+        subprocess.run([str(VENV_PIP), "uninstall", "-y", "samplerate"],
+                       capture_output=True)
+        print("  [修复] ✅ 已卸载，librosa 将自动使用 scipy 重采样（功能不受影响）")
 
 def bootstrap_and_relaunch():
     import time
@@ -141,6 +167,10 @@ def bootstrap_and_relaunch():
             str(VENV_PIP), "install", "--quiet", "--upgrade", *PACKAGES
         ])
         print("  [安装] ✅ 安装完成，重新启动脚本...\n")
+
+    # 每次进入 venv 前都检查 samplerate，无论 venv 是新建还是已存在
+    # （venv 存在但 samplerate 是旧的坏 wheel 时，此处兜底修复，耗时 < 0.1s）
+    _fix_samplerate()
 
     os.execv(str(VENV_PY), [str(VENV_PY)] + sys.argv)
 
@@ -1036,8 +1066,31 @@ def main():
                 results_ok.append(dest)
 
             except Exception as e:
+                err_str = str(e)
+                # 运行时架构不兼容兜底（bootstrap 阶段通常已拦截，此处作二道保险）
+                # 注意：此处不能 os.execv，因为：
+                #   bootstrap 阶段的 _fix_samplerate() 通常已处理，此处作最终兜底。
+                #   不删整个 venv，直接卸掉 samplerate，下次启动 bootstrap 无需重装其他包。
+                if "incompatible architecture" in err_str and "arm64" in err_str:
+                    print()
+                    print("  ╔══════════════════════════════════════════════════════════╗")
+                    print("  ║  ⚠️   检测到架构不兼容，正在自动修复...               ║")
+                    print("  ╚══════════════════════════════════════════════════════════╝")
+                    print()
+                    print("  🔄 正在卸载 samplerate（将使用 scipy 替代，功能不受影响）...")
+                    subprocess.run(
+                        [str(VENV_PIP), "uninstall", "-y", "samplerate"],
+                        capture_output=True,
+                    )
+                    shutil.rmtree(TMP_DIR, ignore_errors=True)
+                    print("  ✅ 修复完成，请关闭此窗口并重新打开 App。")
+                    print()
+                    sys.exit(0)
                 log("错误", f"❌ {src_path.name} 处理失败: {e}")
-                import traceback; traceback.print_exc()
+                try:
+                    import traceback; traceback.print_exc()
+                except Exception:
+                    pass
                 results_err.append(src_path)
                 # 只清理当前文件相关的临时文件，不影响其他文件
                 _cleanup_current_file(src_path)
@@ -1064,7 +1117,10 @@ def main():
         sys.exit(0)
     except Exception as e:
         print(f"\n\n  ❌ 发生错误: {e}")
-        import traceback; traceback.print_exc()
+        try:
+            import traceback; traceback.print_exc()
+        except Exception:
+            pass
         shutil.rmtree(TMP_DIR, ignore_errors=True)
         sys.exit(1)
 
