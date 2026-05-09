@@ -31,8 +31,9 @@
 ## 系统要求
 
 - macOS（Apple Silicon / Intel 均支持）
-- 已安装 [Homebrew](https://brew.sh)（用于自动安装 ffmpeg）
+- 已安装 [Homebrew](https://brew.sh)（用于自动安装 ffmpeg 和 Python 3.11）
 - 无需手动安装 Python 或任何依赖，App 会全自动处理
+- 网络连接（首次安装需要下载依赖；国内网络自动切换镜像源，无需翻墙）
 
 ---
 
@@ -79,6 +80,14 @@ rm -rf ~/.ncm_venv
 
 ---
 
+### 安装依赖时提示代理错误（ProxyError / Privoxy）
+
+系统设置了代理但代理本身不可用，导致 pip 无法联网。App 会自动清除代理设置并重试，同时切换至国内镜像源（清华 / 阿里云），**无需翻墙也能完成安装**。
+
+如果仍然失败，可以手动关闭系统代理后重新打开 App。
+
+---
+
 ### 虚拟环境多次重启仍失败
 
 手动重置环境：
@@ -112,9 +121,10 @@ NCM_DEBUG=1 open /Applications/Convert_to_instrumental.app
 
 App 首次运行时会在后台自动完成以下操作，无需手动干预：
 
-1. 创建独立 Python 虚拟环境（`~/.ncm_venv`）
-2. 安装 AI 分离所需依赖包
-3. 下载模型文件（`~/.audio_separator_models`，约 200MB）
-4. 检测并安装 ffmpeg（通过 Homebrew）
+1. 检测 Python 版本，不足 3.11 时通过 Homebrew 自动安装
+2. 创建独立 Python 虚拟环境（`~/.ncm_venv`）
+3. 安装 AI 分离所需依赖包（国内自动使用清华 / 阿里云镜像）
+4. 下载模型文件（`~/.audio_separator_models`，约 200MB）
+5. 检测并安装 ffmpeg（通过 Homebrew）
 
 后续打开无需重复安装，启动很快。

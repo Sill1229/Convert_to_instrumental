@@ -131,8 +131,13 @@ def ensure_python311() -> str:
 
     print(f"\n  [{ts()}] [安装] 检测到系统 Python 版本过低（{sys.version.split()[0]}）")
     print(f"  [{ts()}] [安装] 正在通过 Homebrew 自动安装 Python 3.11（约 2-5 分钟）...")
+    # 清掉代理环境变量，防止 Privoxy 等损坏的代理干扰 brew 下载
+    clean_env = os.environ.copy()
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                 "all_proxy", "ALL_PROXY"]:
+        clean_env.pop(key, None)
     try:
-        subprocess.check_call([brew, "install", "python@3.11"])
+        subprocess.check_call([brew, "install", "python@3.11"], env=clean_env)
     except subprocess.CalledProcessError:
         print(f"  [{ts()}] [警告] Python 3.11 安装失败，将使用系统 Python（保留和声模式不可用）")
         return sys.executable
@@ -187,6 +192,43 @@ def _fix_samplerate():
                        capture_output=True)
         print("  [修复] ✅ 已卸载，librosa 将自动使用 scipy 重采样（功能不受影响）")
 
+def _pip_install(packages: list, ts):
+    """
+    pip 安装，带两级容错：
+    1. 先用默认设置尝试（清掉可能损坏的系统代理）
+    2. 若失败，自动切换国内镜像源重试（无需翻墙）
+    """
+    # 清掉系统代理环境变量，防止 Privoxy 等坏代理拦截 pip
+    clean_env = os.environ.copy()
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                 "all_proxy", "ALL_PROXY"]:
+        clean_env.pop(key, None)
+
+    pip_base = [str(VENV_PIP), "install", "--quiet", "--upgrade"]
+
+    # 第一次尝试：默认源（代理已清除）
+    r = subprocess.run(pip_base + packages, env=clean_env)
+    if r.returncode == 0:
+        return
+
+    # 第二次尝试：清华大学镜像源（国内直连，无需代理）
+    print(f"\n  [{ts()}] [安装] 默认源失败，切换至国内镜像源重试...")
+    mirrors = [
+        "https://pypi.tuna.tsinghua.edu.cn/simple/",
+        "https://mirrors.aliyun.com/pypi/simple/",
+    ]
+    for mirror in mirrors:
+        r = subprocess.run(
+            pip_base + ["-i", mirror, "--trusted-host", mirror.split("/")[2]] + packages,
+            env=clean_env,
+        )
+        if r.returncode == 0:
+            print(f"  [{ts()}] [安装] ✅ 使用镜像源安装成功：{mirror}")
+            return
+        print(f"  [{ts()}] [安装] 镜像源 {mirror} 失败，尝试下一个...")
+
+    raise RuntimeError("所有安装源均失败，请检查网络连接后重试。")
+
 def bootstrap_and_relaunch():
     import time
     ts = lambda: time.strftime("%H:%M:%S")
@@ -199,6 +241,17 @@ def bootstrap_and_relaunch():
         print(f"     {VENV_PY} -c \"import torch; print(torch.__version__)\"")
         sys.exit(1)
     os.environ["_NCM_BOOT"] = str(boot_count + 1)
+
+    # ── venv Python 版本检测：< 3.10 无法使用保留和声模型，自动升级 ──
+    if VENV_PY.exists():
+        venv_minor = subprocess.run(
+            [str(VENV_PY), "-c", "import sys; print(sys.version_info.minor)"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if venv_minor and int(venv_minor) < 10:
+            print(f"\n  [{ts()}] [升级] 检测到虚拟环境使用 Python 3.{venv_minor}（< 3.10）")
+            print(f"  [{ts()}] [升级] 正在升级至 Python 3.11 以支持「保留和声」模式...")
+            shutil.rmtree(VENV_DIR, ignore_errors=True)
 
     if not VENV_PY.exists():
         if VENV_DIR.exists():
@@ -213,9 +266,7 @@ def bootstrap_and_relaunch():
 
     if not _venv_has_packages():
         print("  [安装] 安装 Python 依赖包（首次约需 5-15 分钟）...")
-        subprocess.check_call([
-            str(VENV_PIP), "install", "--quiet", "--upgrade", *PACKAGES
-        ])
+        _pip_install(PACKAGES, ts)
         print("  [安装] ✅ 安装完成，重新启动脚本...\n")
 
     # 每次进入 venv 前都检查 samplerate，无论 venv 是新建还是已存在
@@ -1121,26 +1172,23 @@ def main():
                 # 注意：此处不能 os.execv，因为：
                 #   bootstrap 阶段的 _fix_samplerate() 通常已处理，此处作最终兜底。
                 #   不删整个 venv，直接卸掉 samplerate，下次启动 bootstrap 无需重装其他包。
-                # 模型不在当前版本支持列表：通常是 Python 3.9 装了旧版 audio-separator
+                # 模型不在支持列表：venv 用 Python 3.9 创建，audio-separator 版本过旧
+                # 删掉 venv，下次启动 bootstrap 会自动安装 Python 3.11 并重建
                 if "not found in supported model files" in err_str:
                     print()
                     print("  ╔══════════════════════════════════════════════════════════╗")
-                    print("  ║  ❌  「保留和声」模式不支持（Python 版本过低）         ║")
+                    print("  ║  🔄  正在自动升级环境以支持「保留和声」模式...         ║")
                     print("  ╚══════════════════════════════════════════════════════════╝")
                     print()
-                    print("  原因：当前 Python < 3.10，只能安装 audio-separator 旧版本，")
-                    print("        旧版本不包含卡拉OK模型。")
+                    print("  检测到 Python 版本过低，需要升级至 3.11。")
+                    print("  正在清理旧环境，请稍后关闭窗口并重新打开 App，")
+                    print("  App 将自动安装 Python 3.11 并重建环境（约 5-15 分钟）。")
                     print()
-                    print("  解决方法（终端运行以下两条命令）：")
+                    shutil.rmtree(VENV_DIR, ignore_errors=True)
+                    shutil.rmtree(TMP_DIR, ignore_errors=True)
+                    print("  ✅ 旧环境已清理，请重新打开 App。")
                     print()
-                    print("    brew install python@3.11")
-                    print(f"    rm -rf {VENV_DIR}")
-                    print()
-                    print("  重新打开 App 后将自动使用 Python 3.11 重建环境，")
-                    print("  「保留和声」模式即可正常使用。")
-                    print()
-                    results_err.append(src_path)
-                    continue
+                    sys.exit(0)
                 if "incompatible architecture" in err_str and "arm64" in err_str:
                     print()
                     print("  ╔══════════════════════════════════════════════════════════╗")
